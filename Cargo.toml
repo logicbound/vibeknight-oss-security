@@ -1,0 +1,6 @@
+[workspace]
+members = [ 
+    "vk-cli",
+    "vk-core",
+    "vk-lang-js"
+]
