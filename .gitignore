@@ -1,0 +1,7 @@
+target/
+/target/
+**/*.swp
+**/*.log
+**/*.tmp
+.env
+.DS_Store
