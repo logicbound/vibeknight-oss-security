@@ -29,8 +29,36 @@ pub enum Expr {
         obj: Box<Expr>,
         prop: String,
     },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     Identifier(String),
     Literal(Value),
+}
+
+/// Binary operations
+#[derive(Debug, Clone, PartialEq)]
+pub enum BinaryOp {
+    // Arithmetic
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    // Comparison
+    Equal,
+    NotEqual,
+    LessThan,
+    LessThanOrEqual,
+    GreaterThan,
+    GreaterThanOrEqual,
+    // Logical
+    And,
+    Or,
+    // String operations
+    Concat, // String concatenation
 }
 
 /// Literal values
@@ -48,6 +76,7 @@ pub struct Function {
     pub name: String,
     pub params: Vec<Parameter>,
     pub blocks: Vec<BasicBlock>,
+    pub entry_block: BlockId,
     pub scope_id: ScopeId,
 }
 
@@ -57,8 +86,13 @@ pub struct Parameter {
     pub symbol_id: SymbolId,
 }
 
+/// Basic block identifier (opaque)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockId(pub u32);
+
 /// Basic block in control flow
 pub struct BasicBlock {
+    pub id: BlockId,
     pub instructions: Vec<Instruction>,
 }
 
@@ -66,6 +100,14 @@ pub struct BasicBlock {
 pub enum Instruction {
     Assign { dst: SymbolId, src: Expr },
     Call { callee: Expr, args: Vec<Expr> },
+    Branch {
+        condition: Expr,
+        then_block: BlockId,
+        else_block: BlockId,
+    },
+    Jump {
+        target: BlockId,
+    },
     Return { value: Option<Expr> },
 }
 
@@ -173,7 +215,6 @@ pub struct ModuleGraph {
 
 /// Node in module graph
 struct ModuleNode {
-    path: String,
     dependencies: Vec<String>,
     dependents: Vec<String>,
 }
@@ -187,8 +228,7 @@ impl ModuleGraph {
 
     pub fn add_module(&mut self, path: String) {
         if !self.modules.contains_key(&path) {
-            self.modules.insert(path.clone(), ModuleNode {
-                path,
+            self.modules.insert(path, ModuleNode {
                 dependencies: Vec::new(),
                 dependents: Vec::new(),
             });

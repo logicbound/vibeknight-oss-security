@@ -54,6 +54,7 @@ fn walk(path: &Path, findings: &mut Vec<Finding>) {
 }
 
 fn check_file(path: &Path) -> Vec<Finding> {
+    println!("Checking file: {}", path.display());
     let text = fs::read_to_string(path).unwrap_or_default();
     let program = lower_to_ir(&text);
     

@@ -7,7 +7,7 @@ use vk_ir::{
     Program, Module, Function, BasicBlock, Instruction, Expr, Value,
     Import, ImportSpecifier, Export, ExportSpecifier,
     SymbolTable, ScopeId, SymbolKind, Parameter,
-    ModuleGraph,
+    ModuleGraph, BlockId,
 };
 
 /// Parse JavaScript source and lower it to IR with symbol resolution
@@ -159,6 +159,103 @@ fn extract_imports_exports(
     (imports, exports)
 }
 
+/// Process arrow functions from variable declarations
+fn process_variable_declaration_arrow_functions(
+    var_decl: &VariableDeclaration<'_>,
+    symbol_table: &mut SymbolTable,
+    scope_stack: &mut Vec<ScopeId>,
+    next_scope_id: &mut u32,
+) -> Vec<Function> {
+    let mut functions = Vec::new();
+    
+    for declarator in &var_decl.declarations {
+        if let Some(init) = &declarator.init {
+            if let Expression::ArrowFunctionExpression(arrow_func) = init {
+                let function_name = match &declarator.id.kind {
+                    BindingPatternKind::BindingIdentifier(ident) => {
+                        ident.name.to_string()
+                    }
+                    _ => continue,
+                };
+                
+                // Create function scope
+                let function_scope = ScopeId(*next_scope_id);
+                *next_scope_id += 1;
+                scope_stack.push(function_scope);
+                
+                // Add function to symbol table
+                let _func_symbol_id = symbol_table.add_symbol(
+                    function_name.clone(),
+                    SymbolKind::Function,
+                    scope_stack[scope_stack.len() - 2],
+                );
+                
+                // Process parameters
+                let params = arrow_func.params.items.iter()
+                    .filter_map(|param| {
+                        match &param.pattern.kind {
+                            BindingPatternKind::BindingIdentifier(ident) => {
+                                let param_name = ident.name.to_string();
+                                let symbol_id = symbol_table.add_symbol(
+                                    param_name.clone(),
+                                    SymbolKind::Parameter,
+                                    function_scope,
+                                );
+                                Some(Parameter {
+                                    name: param_name,
+                                    symbol_id,
+                                })
+                            }
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                
+                // Lower arrow function body
+                let mut blocks = Vec::new();
+                let mut instructions = Vec::new();
+
+                //@TODO: Make next_block_id mutable once we have multiple blocks
+                let next_block_id = 0u32;
+                let entry_block_id = BlockId(next_block_id);
+                // @TODO: Only increment when you actually create another block
+                //next_block_id += 1;
+
+                
+                // Arrow function body handling
+                lower_statements(
+                    &arrow_func.body.statements,
+                    &mut instructions,
+                    symbol_table,
+                    scope_stack,
+                    next_scope_id,
+                );
+                
+                
+                
+                blocks.push(BasicBlock {
+                    id: entry_block_id,
+                    instructions,
+                });
+                
+                
+                functions.push(Function {
+                    name: function_name,
+                    params,
+                    blocks,
+                    entry_block: entry_block_id,
+                    scope_id: function_scope,
+                });
+                
+                
+                scope_stack.pop();
+            }
+        }
+    }
+    
+    functions
+}
+
 /// Lower function declarations to IR with symbol resolution
 fn lower_functions(
     body: &oxc_allocator::Vec<'_, Statement<'_>>,
@@ -210,6 +307,13 @@ fn lower_functions(
                     // Lower function body
                     let mut blocks = Vec::new();
                     let mut instructions = Vec::new();
+
+                    //@TODO: Make next_block_id mutable once we have multiple blocks
+                    let next_block_id = 0u32;
+                    let entry_block_id = BlockId(next_block_id);
+                    // @TODO: Only increment when you actually create another block
+                    //next_block_id += 1;
+
                     
                     if let Some(body) = &func_decl.body {
                         lower_statements(
@@ -222,89 +326,128 @@ fn lower_functions(
                     }
                     
                     blocks.push(BasicBlock {
+                        id: entry_block_id,
                         instructions,
                     });
+                    
                     
                     functions.push(Function {
                         name: function_name,
                         params,
                         blocks,
+                        entry_block: entry_block_id,
                         scope_id: function_scope,
                     });
+                    
                     
                     scope_stack.pop();
                 }
             }
             Statement::Declaration(Declaration::VariableDeclaration(var_decl)) => {
-                // Handle exported arrow functions and const functions
-                for declarator in &var_decl.declarations {
-                    if let Some(init) = &declarator.init {
-                        if let Expression::ArrowFunctionExpression(arrow_func) = init {
-                            let function_name = match &declarator.id.kind {
-                                BindingPatternKind::BindingIdentifier(ident) => {
-                                    ident.name.to_string()
+                // Handle arrow functions in variable declarations
+                functions.extend(process_variable_declaration_arrow_functions(
+                    var_decl,
+                    symbol_table,
+                    scope_stack,
+                    next_scope_id,
+                ));
+            }
+            Statement::ModuleDeclaration(module_decl) => {
+                match &**module_decl {
+                    ModuleDeclaration::ExportNamedDeclaration(export_decl) => {
+                        // Handle exported variable declarations with arrow functions
+                        // e.g., export const register = async (req, res) => { ... }
+                        if let Some(declaration) = &export_decl.declaration {
+                            match declaration {
+                                Declaration::VariableDeclaration(var_decl) => {
+                                    functions.extend(process_variable_declaration_arrow_functions(
+                                        var_decl,
+                                        symbol_table,
+                                        scope_stack,
+                                        next_scope_id,
+                                    ));
                                 }
-                                _ => continue,
-                            };
-                            
-                            // Create function scope
-                            let function_scope = ScopeId(*next_scope_id);
-                            *next_scope_id += 1;
-                            scope_stack.push(function_scope);
-                            
-                            // Add function to symbol table
-                            let _func_symbol_id = symbol_table.add_symbol(
-                                function_name.clone(),
-                                SymbolKind::Function,
-                                scope_stack[scope_stack.len() - 2],
-                            );
-                            
-                            // Process parameters
-                            let params = arrow_func.params.items.iter()
-                                .filter_map(|param| {
-                                    match &param.pattern.kind {
-                                        BindingPatternKind::BindingIdentifier(ident) => {
-                                            let param_name = ident.name.to_string();
-                                            let symbol_id = symbol_table.add_symbol(
-                                                param_name.clone(),
-                                                SymbolKind::Parameter,
-                                                function_scope,
-                                            );
-                                            Some(Parameter {
-                                                name: param_name,
-                                                symbol_id,
+                                Declaration::FunctionDeclaration(func_decl) => {
+                                    // Handle exported function declarations
+                                    if let Some(binding_identifier) = &func_decl.id {
+                                        let function_name = binding_identifier.name.to_string();
+                                        
+                                        // Create function scope
+                                        let function_scope = ScopeId(*next_scope_id);
+                                        *next_scope_id += 1;
+                                        scope_stack.push(function_scope);
+                                        
+                                        // Add function to symbol table
+                                        let _func_symbol_id = symbol_table.add_symbol(
+                                            function_name.clone(),
+                                            SymbolKind::Function,
+                                            scope_stack[scope_stack.len() - 2],
+                                        );
+                                        
+                                        // Process parameters
+                                        let params = func_decl.params.items.iter()
+                                            .filter_map(|param| {
+                                                match &param.pattern.kind {
+                                                    BindingPatternKind::BindingIdentifier(ident) => {
+                                                        let param_name = ident.name.to_string();
+                                                        let symbol_id = symbol_table.add_symbol(
+                                                            param_name.clone(),
+                                                            SymbolKind::Parameter,
+                                                            function_scope,
+                                                        );
+                                                        Some(Parameter {
+                                                            name: param_name,
+                                                            symbol_id,
+                                                        })
+                                                    }
+                                                    _ => None,
+                                                }
                                             })
+                                            .collect();
+                                        
+                                        // Lower function body
+                                        let mut blocks = Vec::new();
+                                        let mut instructions = Vec::new();
+
+                                        //@TODO: Make next_block_id mutable once we have multiple blocks
+                                        let next_block_id = 0u32;
+                                        let entry_block_id = BlockId(next_block_id);
+                                        // @TODO: Only increment when you actually create another block
+                                        //next_block_id += 1;
+
+                                        if let Some(body) = &func_decl.body {
+                                            lower_statements(
+                                                &body.statements,
+                                                &mut instructions,
+                                                symbol_table,
+                                                scope_stack,
+                                                next_scope_id,
+                                            );
                                         }
-                                        _ => None,
+                                        
+                                        blocks.push(BasicBlock {
+                                            id: entry_block_id,
+                                            instructions,
+                                        });
+                                        
+                                        
+                                        functions.push(Function {
+                                            name: function_name,
+                                            params,
+                                            blocks,
+                                            entry_block: entry_block_id,
+                                            scope_id: function_scope,
+                                        });
+                                        
+                                        
+                                        scope_stack.pop();
                                     }
-                                })
-                                .collect();
-                            
-                            // Lower arrow function body
-                            let mut blocks = Vec::new();
-                            let instructions = Vec::new();
-                            
-                            // Arrow function body handling
-                            // In OXC 0.11, arrow function body is stored in arrow_func.body
-                            // which is of type FunctionBody<'a> - a type alias for Statement<'a> | Expression<'a>
-                            // We need to match on the underlying type
-                            // For now, create empty block - full body lowering can be enhanced later
-                            // This preserves function structure in IR for symbol resolution
-                            
-                            blocks.push(BasicBlock {
-                                instructions,
-                            });
-                            
-                            functions.push(Function {
-                                name: function_name,
-                                params,
-                                blocks,
-                                scope_id: function_scope,
-                            });
-                            
-                            scope_stack.pop();
+                                }
+                                _ => {}
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
             _ => {}
