@@ -1,6 +1,8 @@
 [workspace]
+resolver = "1"
 members = [ 
     "vk-cli",
     "vk-core",
+    "vk-ir",
     "vk-lang-js"
 ]

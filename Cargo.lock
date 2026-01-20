@@ -681,18 +681,24 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "vk-ir",
  "vk-lang-js",
 ]
+
+[[package]]
+name = "vk-ir"
+version = "0.1.0"
 
 [[package]]
 name = "vk-lang-js"
 version = "0.1.0"
 dependencies = [
  "oxc_allocator",
+ "oxc_ast",
  "oxc_parser",
  "oxc_span",
  "oxc_syntax",
- "serde",
+ "vk-ir",
 ]
 
 [[package]]

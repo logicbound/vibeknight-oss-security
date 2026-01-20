@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use vk_core::scan::scan_project;
+use vk_core::scan_project;
 
 #[derive(Parser)]
 #[command(author, version, about)]
