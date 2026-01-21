@@ -18,25 +18,33 @@ pub struct Module {
     pub symbols: SymbolTable,
 }
 
+
+/// Annotated expression
+pub type AExpr = Annotated<Expr>;
+pub type AInstruction = Annotated<Instruction>;
+
 /// Normalized expression tree (does not expose parser internals)
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Call {
-        callee: Box<Expr>,
-        args: Vec<Expr>,
+        callee: Box<AExpr>,
+        args: Vec<AExpr>,
     },
     Member {
-        obj: Box<Expr>,
+        obj: Box<AExpr>,
         prop: String,
     },
     Binary {
         op: BinaryOp,
-        left: Box<Expr>,
-        right: Box<Expr>,
+        left: Box<AExpr>,
+        right: Box<AExpr>,
     },
     Identifier(String),
     Literal(Value),
 }
+
+
+
 
 /// Binary operations
 #[derive(Debug, Clone, PartialEq)]
@@ -93,23 +101,58 @@ pub struct BlockId(pub u32);
 /// Basic block in control flow
 pub struct BasicBlock {
     pub id: BlockId,
-    pub instructions: Vec<Instruction>,
+    pub instructions: Vec<Annotated<Instruction>>,
 }
 
 /// Instruction in a basic block
 pub enum Instruction {
-    Assign { dst: SymbolId, src: Expr },
-    Call { callee: Expr, args: Vec<Expr> },
+    Assign { dst: SymbolId, src: AExpr },
+    Call { callee: AExpr, args: Vec<AExpr> },
     Branch {
-        condition: Expr,
+        condition: AExpr,
         then_block: BlockId,
         else_block: BlockId,
     },
     Jump {
         target: BlockId,
     },
-    Return { value: Option<Expr> },
+    Return { value: Option<AExpr> },
 }
+
+/// Source location for Instructions
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// Metadata for Instructions
+#[derive(Debug, Clone, PartialEq)]
+pub struct Metadata {
+    pub source: Option<SourceLocation>,
+    pub symbol: Option<SymbolId>,
+    pub taint: TaintState,
+    pub tags: HashMap<String, String>,
+}
+
+
+/// Taint state for Instructions
+#[derive(Debug, Clone, PartialEq)]
+pub enum TaintState {
+    Untainted,
+    Tainted,
+    Unknown,
+}
+
+/// Annotated node with metadata
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotated<T> {
+    pub node: T,
+    pub meta: Metadata,
+}
+
+
 
 /// Import statement
 pub struct Import {
