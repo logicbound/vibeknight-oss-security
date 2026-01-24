@@ -7,8 +7,34 @@ use vk_ir::{
     Program, Module, Function, BasicBlock, Instruction, Expr, Value,
     Import, ImportSpecifier, Export, ExportSpecifier,
     SymbolTable, ScopeId, SymbolKind, Parameter,
-    ModuleGraph, BlockId,
+    ModuleGraph, BlockId, Annotated, AExpr, AInstruction, Metadata, TaintState,
 };
+
+/// Helper to create annotated expression with default metadata
+fn annotate_expr(expr: Expr) -> AExpr {
+    Annotated {
+        node: expr,
+        meta: Metadata {
+            source: None,
+            symbol: None,
+            taint: TaintState::Unknown,
+            tags: std::collections::HashMap::new(),
+        },
+    }
+}
+
+/// Helper to create annotated instruction with default metadata
+fn annotate_instr(instr: Instruction) -> AInstruction {
+    Annotated {
+        node: instr,
+        meta: Metadata {
+            source: None,
+            symbol: None,
+            taint: TaintState::Unknown,
+            tags: std::collections::HashMap::new(),
+        },
+    }
+}
 
 /// Parse JavaScript source and lower it to IR with symbol resolution
 pub fn lower_to_ir(source: &str) -> Program {
@@ -213,7 +239,7 @@ fn process_variable_declaration_arrow_functions(
                 
                 // Lower arrow function body
                 let mut blocks = Vec::new();
-                let mut instructions = Vec::new();
+                let mut instructions: Vec<AInstruction> = Vec::new();
 
                 //@TODO: Make next_block_id mutable once we have multiple blocks
                 let next_block_id = 0u32;
@@ -306,7 +332,7 @@ fn lower_functions(
                     
                     // Lower function body
                     let mut blocks = Vec::new();
-                    let mut instructions = Vec::new();
+                    let mut instructions: Vec<AInstruction> = Vec::new();
 
                     //@TODO: Make next_block_id mutable once we have multiple blocks
                     let next_block_id = 0u32;
@@ -460,7 +486,7 @@ fn lower_functions(
 /// Lower statements to instructions
 fn lower_statements(
     statements: &oxc_allocator::Vec<'_, Statement<'_>>,
-    instructions: &mut Vec<Instruction>,
+    instructions: &mut Vec<AInstruction>,
     symbol_table: &mut SymbolTable,
     scope_stack: &mut Vec<ScopeId>,
     _next_scope_id: &mut u32,
@@ -486,10 +512,10 @@ fn lower_statements(
                         );
                         
                         let src = normalize_expression(init, symbol_table, scope_stack);
-                        instructions.push(Instruction::Assign {
+                        instructions.push(annotate_instr(Instruction::Assign {
                             dst: symbol_id,
                             src,
-                        });
+                        }));
                     }
                 }
             }
@@ -497,11 +523,11 @@ fn lower_statements(
                 let normalized = normalize_expression(&expr_stmt.expression, symbol_table, scope_stack);
                 
                 // If it's a call, emit as Call instruction
-                if let Expr::Call { callee, args } = normalized {
-                    instructions.push(Instruction::Call {
+                if let Expr::Call { callee, args } = normalized.node {
+                    instructions.push(annotate_instr(Instruction::Call {
                         callee: *callee,
                         args,
-                    });
+                    }));
                 } else {
                     // Other expressions are evaluated but result is discarded
                     // Could emit as side-effect instruction if needed
@@ -510,7 +536,7 @@ fn lower_statements(
             Statement::ReturnStatement(ret_stmt) => {
                 let value = ret_stmt.argument.as_ref()
                     .map(|expr| normalize_expression(expr, symbol_table, scope_stack));
-                instructions.push(Instruction::Return { value });
+                instructions.push(annotate_instr(Instruction::Return { value }));
             }
             _ => {
                 // Other statements can be added later
@@ -524,27 +550,27 @@ fn normalize_expression(
     expr: &Expression<'_>,
     symbol_table: &mut SymbolTable,
     scope_stack: &[ScopeId],
-) -> Expr {
+) -> AExpr {
     match expr {
         Expression::CallExpression(call_expr) => {
             let callee = Box::new(normalize_expression(&call_expr.callee, symbol_table, scope_stack));
-            let args: Vec<Expr> = call_expr.arguments.iter()
+            let args: Vec<AExpr> = call_expr.arguments.iter()
                 .map(|arg| {
                     match arg {
                         Argument::Expression(expr) => normalize_expression(expr, symbol_table, scope_stack),
-                        _ => Expr::Literal(Value::Undefined),
+                        _ => annotate_expr(Expr::Literal(Value::Undefined)),
                     }
                 })
                 .collect();
             
-            Expr::Call { callee, args }
+            annotate_expr(Expr::Call { callee, args })
         }
         Expression::MemberExpression(member_expr) => {
             match &**member_expr {
                 MemberExpression::StaticMemberExpression(static_member) => {
                     let obj = Box::new(normalize_expression(&static_member.object, symbol_table, scope_stack));
                     let prop = static_member.property.name.to_string();
-                    Expr::Member { obj, prop }
+                    annotate_expr(Expr::Member { obj, prop })
                 }
                 MemberExpression::ComputedMemberExpression(computed_member) => {
                     // For computed members, we'll simplify to just the object
@@ -553,7 +579,7 @@ fn normalize_expression(
                 }
                 MemberExpression::PrivateFieldExpression(_) => {
                     // Private field access - simplified for now
-                    Expr::Literal(Value::Undefined)
+                    annotate_expr(Expr::Literal(Value::Undefined))
                 }
             }
         }
@@ -563,26 +589,26 @@ fn normalize_expression(
             // Try to resolve symbol (for closure/scope tracking)
             // For now, we'll just use the identifier name
             // Full symbol resolution can be enhanced later
-            Expr::Identifier(name)
+            annotate_expr(Expr::Identifier(name))
         }
         Expression::StringLiteral(lit) => {
-            Expr::Literal(Value::String(lit.value.to_string()))
+            annotate_expr(Expr::Literal(Value::String(lit.value.to_string())))
         }
         Expression::NumericLiteral(lit) => {
-            Expr::Literal(Value::Number(lit.value))
+            annotate_expr(Expr::Literal(Value::Number(lit.value)))
         }
         Expression::BooleanLiteral(lit) => {
-            Expr::Literal(Value::Boolean(lit.value))
+            annotate_expr(Expr::Literal(Value::Boolean(lit.value)))
         }
         Expression::NullLiteral(_) => {
-            Expr::Literal(Value::Null)
+            annotate_expr(Expr::Literal(Value::Null))
         }
         Expression::ObjectExpression(_obj_expr) => {
             // Object literals - simplified to just a literal for now
-            Expr::Literal(Value::Null)
+            annotate_expr(Expr::Literal(Value::Null))
         }
         Expression::ArrayExpression(_) => {
-            Expr::Literal(Value::Null)
+            annotate_expr(Expr::Literal(Value::Null))
         }
         Expression::BinaryExpression(bin_expr) => {
             // Binary expressions - normalize both sides
@@ -603,29 +629,29 @@ fn normalize_expression(
         Expression::NewExpression(new_expr) => {
             // New expression - treat as call
             let callee = Box::new(normalize_expression(&new_expr.callee, symbol_table, scope_stack));
-            let args: Vec<Expr> = new_expr.arguments.iter()
+            let args: Vec<AExpr> = new_expr.arguments.iter()
                 .map(|arg| {
                     match arg {
                         Argument::Expression(expr) => normalize_expression(expr, symbol_table, scope_stack),
-                        _ => Expr::Literal(Value::Undefined),
+                        _ => annotate_expr(Expr::Literal(Value::Undefined)),
                     }
                 })
                 .collect();
-            Expr::Call { callee, args }
+            annotate_expr(Expr::Call { callee, args })
         }
         Expression::TemplateLiteral(_) => {
-            Expr::Literal(Value::String(String::new()))
+            annotate_expr(Expr::Literal(Value::String(String::new())))
         }
         Expression::ArrowFunctionExpression(_) => {
             // Arrow functions in expressions - simplified
-            Expr::Literal(Value::Null)
+            annotate_expr(Expr::Literal(Value::Null))
         }
         Expression::FunctionExpression(_) => {
-            Expr::Literal(Value::Null)
+            annotate_expr(Expr::Literal(Value::Null))
         }
         _ => {
             // Unknown expression type - return undefined
-            Expr::Literal(Value::Undefined)
+            annotate_expr(Expr::Literal(Value::Undefined))
         }
     }
 }

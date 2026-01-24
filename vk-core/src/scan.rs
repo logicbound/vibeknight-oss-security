@@ -73,11 +73,11 @@ fn scan_ir(program: &Program, file_path: &Path, findings: &mut Vec<Finding>) {
         for function in &module.functions {
             for block in &function.blocks {
                 for instruction in &block.instructions {
-                    match instruction {
+                    match &instruction.node {
                         vk_ir::Instruction::Call { callee, args: _ } => {
                             // Simple heuristic: detect potentially dangerous calls
                             // Check if callee is an identifier or member expression
-                            let callee_str = match callee {
+                            let callee_str = match &callee.node {
                                 vk_ir::Expr::Identifier(name) => name.clone(),
                                 vk_ir::Expr::Member { obj: _, prop } => prop.clone(),
                                 _ => String::new(),
@@ -86,7 +86,7 @@ fn scan_ir(program: &Program, file_path: &Path, findings: &mut Vec<Finding>) {
                             if callee_str.contains("query") && !callee_str.contains("prepared") {
                                 findings.push(Finding {
                                     file: file_path.to_string_lossy().to_string(),
-                                    line: 1, // TODO: track line numbers in IR
+                                    line: instruction.meta.source.as_ref().map(|s| s.line as usize).unwrap_or(1),
                                     description: format!("Potential SQL injection in call to {}", callee_str),
                                 });
                             }
