@@ -232,6 +232,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "macros"
+version = "0.1.0"
+
+[[package]]
 name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -679,6 +683,7 @@ dependencies = [
 name = "vk-core"
 version = "0.1.0"
 dependencies = [
+ "macros",
  "serde",
  "serde_json",
  "vk-ir",
@@ -688,11 +693,15 @@ dependencies = [
 [[package]]
 name = "vk-ir"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "vk-lang-js"
 version = "0.1.0"
 dependencies = [
+ "macros",
  "oxc_allocator",
  "oxc_ast",
  "oxc_parser",

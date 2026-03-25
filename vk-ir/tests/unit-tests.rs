@@ -8,7 +8,7 @@ mod tests {
         Metadata {
             source: None,
             symbol: None,
-            taint: TaintState::Untainted,
+            taint: TaintState::default(),
             tags: HashMap::new(),
         }
     }
@@ -22,7 +22,7 @@ mod tests {
             column: 5,
         });
         meta.symbol = Some(SymbolId(42));
-        meta.taint = TaintState::Tainted;
+        meta.taint = TaintState::tainted(TaintKind::UserInput);
         meta.tags.insert("user_input".to_string(), "true".to_string());
 
         let instr = Annotated {
@@ -38,14 +38,14 @@ mod tests {
         assert_eq!(instr.meta.source.as_ref().unwrap().file, "main.js");
         assert_eq!(instr.meta.source.as_ref().unwrap().line, 10);
         assert_eq!(instr.meta.symbol.unwrap(), SymbolId(42));
-        assert_eq!(instr.meta.taint, TaintState::Tainted);
+        assert!(instr.meta.taint.is_tainted());
         assert_eq!(instr.meta.tags.get("user_input").unwrap(), "true");
     }
 
     #[test]
     fn test_expression_metadata_propagation() {
         let mut meta = default_metadata();
-        meta.taint = TaintState::Tainted;
+        meta.taint = TaintState::tainted(TaintKind::UserInput);
 
         let expr = Annotated {
             node: Expr::Call {
@@ -62,7 +62,7 @@ mod tests {
         };
 
         if let Expr::Call { args, .. } = &expr.node {
-            assert_eq!(args[0].meta.taint, TaintState::Tainted);
+            assert!(args[0].meta.taint.is_tainted());
         } else {
             panic!("Expected Call expression");
         }
@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn test_taint_initially_empty() {
         let meta = default_metadata();
-        assert_eq!(meta.taint, TaintState::Untainted);
+        assert!(!meta.taint.is_tainted());
         assert!(meta.tags.is_empty());
         assert!(meta.source.is_none());
         assert!(meta.symbol.is_none());

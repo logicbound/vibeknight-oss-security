@@ -1,3 +1,20 @@
 pub mod scan;
+pub mod rule;
+pub mod registry;
+pub mod config;
+pub mod pipeline;
+pub mod context;
+pub mod rules;
+pub mod language;
+pub mod languages;
+pub mod taint;
+pub mod finding;
 
 pub use scan::scan_project;
+pub use finding::{Finding, DataFlowPath, FixSuggestion, FlowNode, FlowStep, FlowOperation};
+pub use rule::{Rule, Severity};
+pub use registry::RuleRegistry;
+pub use config::RuleConfig;
+pub use pipeline::RulePipeline;
+pub use context::AnalysisContext;
+pub use language::{LanguageFrontend, LanguageRegistry};

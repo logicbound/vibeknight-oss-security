@@ -5,3 +5,4 @@ target/
 **/*.tmp
 .env
 .DS_Store
+.vscode/

@@ -19,6 +19,11 @@ enum Commands {
         /// Output format: console | json
         #[arg(short, long, default_value = "console")]
         output: String,
+
+        /// Exclude folders from scanning (can be specified multiple times)
+        /// Examples: --exclude node_modules --exclude dist --exclude build
+        #[arg(short = 'e', long = "exclude", num_args = 0..)]
+        exclude: Vec<String>,
     },
 }
 
@@ -26,8 +31,8 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Scan { target, output } => {
-            scan_project(target, output);
+        Commands::Scan { target, output, exclude } => {
+            scan_project(target, output, exclude);
         }
     }
 }

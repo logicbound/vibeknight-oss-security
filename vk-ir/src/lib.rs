@@ -120,7 +120,7 @@ pub enum Instruction {
 }
 
 /// Source location for Instructions
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SourceLocation {
     pub file: String,
     pub line: u32,
@@ -137,12 +137,105 @@ pub struct Metadata {
 }
 
 
-/// Taint state for Instructions
+/// Kind of taint (source of untrusted data)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TaintKind {
+    /// User input (forms, query params, etc.)
+    UserInput,
+    /// Network data (HTTP requests, sockets, etc.)
+    Network,
+    /// File system (file reads, etc.)
+    FileSystem,
+    /// Environment variables
+    Env,
+    /// Cookies
+    Cookie,
+    /// Unknown/unspecified taint source
+    Unknown,
+}
+
+impl TaintKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaintKind::UserInput => "user_input",
+            TaintKind::Network => "network",
+            TaintKind::FileSystem => "filesystem",
+            TaintKind::Env => "env",
+            TaintKind::Cookie => "cookie",
+            TaintKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// Taint state tracking sources, sinks, and sanitizers
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaintState {
+    /// No taint present
     Untainted,
-    Tainted,
+    /// Tainted with specific kinds
+    Tainted {
+        kinds: Vec<TaintKind>,
+    },
+    /// Sanitized (taint removed)
+    Sanitized {
+        original_kinds: Vec<TaintKind>,
+        sanitizer: String,
+    },
+    /// Unknown/ambiguous state
     Unknown,
+}
+
+impl TaintState {
+    /// Create a tainted state with a single kind
+    pub fn tainted(kind: TaintKind) -> Self {
+        Self::Tainted {
+            kinds: vec![kind],
+        }
+    }
+    
+    /// Create a tainted state with multiple kinds
+    pub fn tainted_multi(kinds: Vec<TaintKind>) -> Self {
+        Self::Tainted { kinds }
+    }
+    
+    /// Check if this state is tainted
+    pub fn is_tainted(&self) -> bool {
+        matches!(self, TaintState::Tainted { .. })
+    }
+    
+    /// Check if this state is sanitized
+    pub fn is_sanitized(&self) -> bool {
+        matches!(self, TaintState::Sanitized { .. })
+    }
+    
+    /// Get taint kinds if tainted
+    pub fn kinds(&self) -> Vec<TaintKind> {
+        match self {
+            TaintState::Tainted { kinds } => kinds.clone(),
+            TaintState::Sanitized { original_kinds, .. } => original_kinds.clone(),
+            _ => Vec::new(),
+        }
+    }
+    
+    /// Merge two taint states (union of kinds)
+    pub fn merge(&self, other: &Self) -> Self {
+        let mut all_kinds = self.kinds();
+        all_kinds.extend(other.kinds());
+        all_kinds.sort_by_key(|k| k.as_str());
+        all_kinds.dedup();
+        
+        if all_kinds.is_empty() {
+            TaintState::Untainted
+        } else {
+            TaintState::Tainted { kinds: all_kinds }
+        }
+    }
+}
+
+impl Default for TaintState {
+    fn default() -> Self {
+        Self::Untainted
+    }
 }
 
 /// Annotated node with metadata
@@ -188,6 +281,7 @@ pub struct SymbolId(pub u32);
 pub struct ScopeId(pub u32);
 
 /// Symbol table for a module
+#[derive(Clone)]
 pub struct SymbolTable {
     symbols: HashMap<SymbolId, Symbol>,
     by_name: HashMap<String, Vec<SymbolId>>,
@@ -228,6 +322,13 @@ impl SymbolTable {
     pub fn find_symbols(&self, name: &str) -> Vec<&Symbol> {
         self.by_name.get(name)
             .map(|ids| ids.iter().filter_map(|id| self.symbols.get(id)).collect())
+            .unwrap_or_default()
+    }
+    
+    /// Find symbol IDs by name
+    pub fn find_symbol_ids(&self, name: &str) -> Vec<SymbolId> {
+        self.by_name.get(name)
+            .cloned()
             .unwrap_or_default()
     }
 }

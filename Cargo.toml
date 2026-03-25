@@ -1,6 +1,6 @@
 [workspace]
 resolver = "1"
-members = [ 
+members = [ "macros", 
     "vk-cli",
     "vk-core",
     "vk-ir",
