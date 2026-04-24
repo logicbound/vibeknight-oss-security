@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use emitter::{IngestJob, INGEST_JOB_SCHEMA_VERSION};
 use state::IngestorState;
-use stream::{build_client, ChangeStream};
+use stream::{build_client, fetch_current_seq, fetch_packument, poll_changes, DEFAULT_LIMIT};
 
 // ── CLI args ──────────────────────────────────────────────────────────────────
 
@@ -89,7 +89,6 @@ fn main() {
     let args = parse_args();
     let mut state = IngestorState::load(&args.state_path);
 
-    // Build the output sink: Redis > file > stdout
     let mut sink: Sink = if let Some(url) = &args.redis_url {
         match queue::connect(url) {
             Ok(con) => {
@@ -120,72 +119,108 @@ fn main() {
         std::process::exit(1);
     });
 
+    // On a fresh start, jump to the current tip instead of replaying history.
+    // "0" is the sentinel for "starting fresh" written by IngestorState::default.
+    if state.last_seq == "0" {
+        match fetch_current_seq(&http) {
+            Ok(seq) => {
+                eprintln!("[ingestor] Fresh start: jumping to current tip seq={}", seq);
+                state.last_seq = seq;
+                let _ = state.save(&args.state_path);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[ingestor] Failed to fetch current tip ({}). Falling back to since=0.",
+                    e
+                );
+            }
+        }
+    }
+
     let mut backoff_secs: u64 = 1;
 
     loop {
-        eprintln!("[ingestor] Connecting from seq={}", state.last_seq);
-
-        match ChangeStream::connect(&http, &state.last_seq) {
+        match poll_changes(&http, &state.last_seq, DEFAULT_LIMIT) {
             Err(e) => {
-                eprintln!("[ingestor] Connection error: {}. Retrying in {}s.", e, backoff_secs);
+                eprintln!(
+                    "[ingestor] Poll error: {}. Retrying in {}s.",
+                    e, backoff_secs
+                );
                 std::thread::sleep(Duration::from_secs(backoff_secs));
                 backoff_secs = (backoff_secs * 2).min(60);
                 continue;
             }
-            Ok(stream) => {
+            Ok(changes) => {
                 backoff_secs = 1;
-                let mut jobs_emitted: u64 = 0;
 
-                for line_result in stream {
-                    let line = match line_result {
-                        Ok(l) => l,
+                let num_changed = changes.package_ids.len();
+                let mut jobs_emitted: u64 = 0;
+                let mut fetch_errors: u64 = 0;
+
+                for pkg in &changes.package_ids {
+                    let packument = match fetch_packument(&http, pkg) {
+                        Ok(p) => p,
                         Err(e) => {
-                            eprintln!("[ingestor] Stream read error: {}. Reconnecting.", e);
-                            break;
+                            eprintln!("[ingestor] Packument fetch failed for {}: {}", pkg, e);
+                            fetch_errors += 1;
+                            continue;
                         }
                     };
 
-                    for event in &line.events {
-                        let pkg_ver = format!("{}@{}", event.package, event.version);
+                    let Some(event) = parser::parse_packument_latest(&packument, pkg) else {
+                        continue;
+                    };
 
-                        if state.seen.contains_key(&pkg_ver) {
-                            continue;
-                        }
-
-                        if let Some(priority) = filter::score(event, &state) {
-                            let job = IngestJob {
-                                schema_version: INGEST_JOB_SCHEMA_VERSION,
-                                package: event.package.clone(),
-                                version: event.version.clone(),
-                                tarball_url: event.tarball_url.clone(),
-                                last_modified: event.last_modified.clone(),
-                                priority,
-                            };
-
-                            if let Err(e) = sink.emit(&job) {
-                                eprintln!("[ingestor] Emit error: {}", e);
-                                std::process::exit(1);
-                            }
-
-                            jobs_emitted += 1;
-                            if jobs_emitted % 100 == 0 {
-                                sink.flush();
-                            }
-
-                            state.mark_seen(&event.package, &event.version);
-                        }
+                    let pkg_ver = format!("{}@{}", event.package, event.version);
+                    if state.seen.contains_key(&pkg_ver) {
+                        continue;
                     }
 
-                    if let Some(seq) = line.seq {
-                        state.last_seq = seq;
-                        if let Err(e) = state.save(&args.state_path) {
-                            eprintln!("[ingestor] State save error: {}", e);
+                    if let Some(priority) = filter::score(&event, &state) {
+                        let job = IngestJob {
+                            schema_version: INGEST_JOB_SCHEMA_VERSION,
+                            package: event.package.clone(),
+                            version: event.version.clone(),
+                            tarball_url: event.tarball_url.clone(),
+                            last_modified: event.last_modified.clone(),
+                            priority,
+                        };
+
+                        if let Err(e) = sink.emit(&job) {
+                            eprintln!("[ingestor] Emit error: {}", e);
+                            std::process::exit(1);
                         }
+
+                        jobs_emitted += 1;
+                        if jobs_emitted % 100 == 0 {
+                            sink.flush();
+                        }
+
+                        state.mark_seen(&event.package, &event.version);
                     }
                 }
 
-                eprintln!("[ingestor] Stream ended. Reconnecting in {}s.", backoff_secs);
-                std::thread::sleep(Duration::from_secs(backoff_secs));
+                // Advance the cursor once we've processed this batch, and
+                // persist so restarts don't re-process.
+                if changes.last_seq != state.last_seq {
+                    state.last_seq = changes.last_seq.clone();
+                    if let Err(e) = state.save(&args.state_path) {
+                        eprintln!("[ingestor] State save error: {}", e);
+                    }
+                }
+                sink.flush();
+
+                eprintln!(
+                    "[ingestor] Batch done: changes={}, jobs_emitted={}, fetch_errors={}, new_seq={}",
+                    num_changed, jobs_emitted, fetch_errors, state.last_seq
+                );
+
+                // If we got fewer than `limit` results we've caught up; wait
+                // a bit before polling again. Otherwise poll immediately — we
+                // may still be behind the tip.
+                if (num_changed as u32) < DEFAULT_LIMIT {
+                    std::thread::sleep(Duration::from_secs(5));
+                }
             }
         }
     }
