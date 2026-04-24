@@ -17,7 +17,7 @@ impl Default for IngestorState {
         Self {
             //now is now, 0 is beginning of time
             //last_seq: "0".to_string(),
-            last_seq: "now".to_string(),
+            last_seq: "0".to_string(),
             seen: HashMap::new(),
         }
     }
@@ -35,7 +35,7 @@ impl IngestorState {
         if state.last_seq.is_empty() {
             //now is now, 0 is beginning of time
             //state.last_seq = "0".to_string();
-            state.last_seq = "now".to_string();
+            state.last_seq = "0".to_string();
         }
         state
     }
