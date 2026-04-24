@@ -1,20 +1,207 @@
-pub mod scan;
-pub mod rule;
-pub mod registry;
-pub mod config;
-pub mod pipeline;
-pub mod context;
-pub mod rules;
-pub mod language;
-pub mod languages;
-pub mod taint;
+pub mod callgraph;
 pub mod finding;
+pub mod flow;
+pub mod signals;
 
-pub use scan::scan_project;
-pub use finding::{Finding, DataFlowPath, FixSuggestion, FlowNode, FlowStep, FlowOperation};
-pub use rule::{Rule, Severity};
-pub use registry::RuleRegistry;
-pub use config::RuleConfig;
-pub use pipeline::RulePipeline;
-pub use context::AnalysisContext;
-pub use language::{LanguageFrontend, LanguageRegistry};
+use std::collections::HashSet;
+
+use vk_ir::{ExecutionContext, ExecutionPhase, IrNode, IrNodeKind, SourceLocation, SCHEMA_VERSION};
+use vk_lang_js::analyse_file;
+use vk_npm::PackageGraph;
+
+pub use finding::{Evidence, Finding};
+pub use flow::BehaviorGraph;
+pub use signals::Signal;
+
+// ── Output artifacts ──────────────────────────────────────────────────────────
+
+/// The `ir_graph.json` artifact — all IR nodes across all files.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct IrGraph {
+    pub schema_version: String,
+    pub nodes: Vec<IrNode>,
+}
+
+// ── Pipeline ──────────────────────────────────────────────────────────────────
+
+/// Run the full analysis pipeline on an already-ingested package.
+///
+/// Steps:
+/// 1. Analyse each JS/TS file in the package → emit IR nodes
+/// 2. Inject EntryPoint nodes from the package graph
+/// 3. Build call graph
+/// 4. Build behaviour graph (execution chains)
+/// 5. Post-pass: propagate ExecutionContext.phase for install-script entry points
+/// 6. Derive signals
+/// 7. Normalise output ordering
+/// 8. Assemble Finding
+pub fn analyse(package: &PackageGraph) -> (IrGraph, BehaviorGraph, Finding) {
+    // ── Stage 1+2: AST → IR ───────────────────────────────────────────────────
+    let mut all_nodes: Vec<IrNode> = Vec::new();
+
+    for file_rel in &package.files {
+        let abs = package.extracted_dir.join(file_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Ok(source) = std::fs::read_to_string(&abs) else { continue };
+        let file_ir = analyse_file(&source, file_rel);
+        all_nodes.extend(file_ir.nodes);
+    }
+
+    // Inject EntryPoint nodes from the package manifest
+    for ep in &package.entry_points {
+        match ep {
+            vk_npm::EntryPoint::InstallScript { script, command: _ } => {
+                let loc = SourceLocation {
+                    file: "package.json".to_string(),
+                    line: 0,
+                    col: 0,
+                };
+                all_nodes.push(IrNode::new(
+                    IrNodeKind::EntryPoint { script: Some(script.clone()) },
+                    loc,
+                ));
+            }
+            vk_npm::EntryPoint::File { path } => {
+                let loc = SourceLocation {
+                    file: path.clone(),
+                    line: 1,
+                    col: 0,
+                };
+                all_nodes.push(IrNode::new(
+                    IrNodeKind::EntryPoint { script: None },
+                    loc,
+                ));
+            }
+        }
+    }
+
+    // ── Stage 3: Call graph ───────────────────────────────────────────────────
+    let call_graph = callgraph::CallGraph::build(&all_nodes);
+
+    // ── Stage 4: Flow linking ─────────────────────────────────────────────────
+    let behavior_graph = flow::build_behavior_graph(&all_nodes, &call_graph);
+
+    // ── Stage 5: ExecutionContext propagation ─────────────────────────────────
+    // Find node IDs that appear in chains rooted at install-script entry points
+    let install_node_ids = collect_install_node_ids(&behavior_graph);
+
+    // Annotate those nodes with phase=Install
+    for node in &mut all_nodes {
+        if let Some((phase, entry_point)) = install_node_ids.get(&node.id) {
+            node.context = ExecutionContext {
+                phase: phase.clone(),
+                entry_point: Some(entry_point.clone()),
+            };
+        }
+    }
+
+    // ── Stage 6: Output normalisation ─────────────────────────────────────────
+    all_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let ir_graph = IrGraph {
+        schema_version: SCHEMA_VERSION.to_string(),
+        nodes: all_nodes.clone(),
+    };
+
+    // ── Stage 7: Signal derivation ────────────────────────────────────────────
+    let signals = signals::derive_signals(&all_nodes, &behavior_graph);
+
+    // ── Stage 8: Evidence extraction ──────────────────────────────────────────
+    let evidence: Vec<Evidence> = all_nodes
+        .iter()
+        .filter(|n| is_evidence_node(n))
+        .map(|n| Evidence {
+            kind: kind_tag_str(&n.kind).to_string(),
+            detail: extract_detail(&n.kind),
+            file: n.location.file.clone(),
+            line: n.location.line,
+        })
+        .collect();
+
+    let finding = Finding::new(
+        package.package.clone(),
+        package.version.clone(),
+        package.integrity_hash.clone(),
+        signals,
+        behavior_graph.execution_chains.clone(),
+        evidence,
+    );
+
+    (ir_graph, behavior_graph, finding)
+}
+
+// ── ExecutionContext propagation ──────────────────────────────────────────────
+
+/// Collect the IDs of all nodes that appear in chains rooted at install-script
+/// entry points. Returns a map: node_id → (ExecutionPhase, script_name).
+fn collect_install_node_ids(
+    behavior_graph: &flow::BehaviorGraph,
+) -> std::collections::HashMap<String, (ExecutionPhase, String)> {
+    let mut result = std::collections::HashMap::new();
+
+    for chain in &behavior_graph.execution_chains {
+        // Only propagate for install-script entry points
+        let Some(script_name) = &chain.entry_point.script else { continue };
+
+        for step in &chain.chain {
+            result.entry(step.node_id.clone()).or_insert_with(|| {
+                (ExecutionPhase::Install, script_name.clone())
+            });
+        }
+    }
+
+    result
+}
+
+// ── Collect node IDs reachable from entry points ──────────────────────────────
+
+/// Collect all node IDs that appear across all chains (for graph walking).
+#[allow(dead_code)]
+fn collect_reachable_ids(behavior_graph: &flow::BehaviorGraph) -> HashSet<String> {
+    behavior_graph
+        .execution_chains
+        .iter()
+        .flat_map(|c| c.chain.iter().map(|s| s.node_id.clone()))
+        .collect()
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn is_evidence_node(node: &IrNode) -> bool {
+    matches!(
+        &node.kind,
+        IrNodeKind::ProcessExec { .. }
+            | IrNodeKind::NetworkRequest { .. }
+            | IrNodeKind::Eval { .. }
+            | IrNodeKind::FunctionConstructor { .. }
+            | IrNodeKind::EncodedString { .. }
+            | IrNodeKind::ObfuscatedFlow
+    )
+}
+
+fn kind_tag_str(kind: &IrNodeKind) -> &'static str {
+    match kind {
+        IrNodeKind::EntryPoint { .. }          => "EntryPoint",
+        IrNodeKind::Function { .. }            => "Function",
+        IrNodeKind::Call { .. }                => "Call",
+        IrNodeKind::ProcessExec { .. }         => "ProcessExec",
+        IrNodeKind::FileRead { .. }            => "FileRead",
+        IrNodeKind::FileWrite { .. }           => "FileWrite",
+        IrNodeKind::NetworkRequest { .. }      => "NetworkRequest",
+        IrNodeKind::Eval { .. }                => "Eval",
+        IrNodeKind::DynamicImport { .. }       => "DynamicImport",
+        IrNodeKind::FunctionConstructor { .. } => "FunctionConstructor",
+        IrNodeKind::EncodedString { .. }       => "EncodedString",
+        IrNodeKind::ObfuscatedFlow             => "ObfuscatedFlow",
+    }
+}
+
+fn extract_detail(kind: &IrNodeKind) -> Option<String> {
+    match kind {
+        IrNodeKind::ProcessExec { command }       => command.clone(),
+        IrNodeKind::NetworkRequest { url }        => url.clone(),
+        IrNodeKind::Eval { raw_arg }              => raw_arg.clone(),
+        IrNodeKind::FunctionConstructor { body }  => body.clone(),
+        IrNodeKind::EncodedString { value, .. }   => Some(value.clone()),
+        _ => None,
+    }
+}

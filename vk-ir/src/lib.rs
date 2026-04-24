@@ -1,411 +1,301 @@
-// Intermediate Representation (IR) for Vibe Knight
-// Language-agnostic IR that serves as the boundary between parsing and analysis
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use std::collections::HashMap;
+// ── Schema version ────────────────────────────────────────────────────────────
 
-/// Top-level program representation
-pub struct Program {
-    pub modules: Vec<Module>,
-    pub module_graph: ModuleGraph,
-}
+pub const SCHEMA_VERSION: &str = "1.0";
 
-/// Represents a module/file
-pub struct Module {
-    pub path: String,
-    pub functions: Vec<Function>,
-    pub imports: Vec<Import>,
-    pub exports: Vec<Export>,
-    pub symbols: SymbolTable,
-}
+// ── Source location ───────────────────────────────────────────────────────────
 
-
-/// Annotated expression
-pub type AExpr = Annotated<Expr>;
-pub type AInstruction = Annotated<Instruction>;
-
-/// Normalized expression tree (does not expose parser internals)
-#[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
-    Call {
-        callee: Box<AExpr>,
-        args: Vec<AExpr>,
-    },
-    Member {
-        obj: Box<AExpr>,
-        prop: String,
-    },
-    Binary {
-        op: BinaryOp,
-        left: Box<AExpr>,
-        right: Box<AExpr>,
-    },
-    Identifier(String),
-    Literal(Value),
-}
-
-
-
-
-/// Binary operations
-#[derive(Debug, Clone, PartialEq)]
-pub enum BinaryOp {
-    // Arithmetic
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    Modulo,
-    // Comparison
-    Equal,
-    NotEqual,
-    LessThan,
-    LessThanOrEqual,
-    GreaterThan,
-    GreaterThanOrEqual,
-    // Logical
-    And,
-    Or,
-    // String operations
-    Concat, // String concatenation
-}
-
-/// Literal values
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    String(String),
-    Number(f64),
-    Boolean(bool),
-    Null,
-    Undefined,
-}
-
-/// Function representation
-pub struct Function {
-    pub name: String,
-    pub params: Vec<Parameter>,
-    pub blocks: Vec<BasicBlock>,
-    pub entry_block: BlockId,
-    pub scope_id: ScopeId,
-}
-
-/// Function parameter
-pub struct Parameter {
-    pub name: String,
-    pub symbol_id: SymbolId,
-}
-
-/// Basic block identifier (opaque)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BlockId(pub u32);
-
-/// Basic block in control flow
-pub struct BasicBlock {
-    pub id: BlockId,
-    pub instructions: Vec<Annotated<Instruction>>,
-}
-
-/// Instruction in a basic block
-pub enum Instruction {
-    Assign { dst: SymbolId, src: AExpr },
-    Call { callee: AExpr, args: Vec<AExpr> },
-    Branch {
-        condition: AExpr,
-        then_block: BlockId,
-        else_block: BlockId,
-    },
-    Jump {
-        target: BlockId,
-    },
-    Return { value: Option<AExpr> },
-}
-
-/// Source location for Instructions
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Source location for any IR node — file-relative path, 1-indexed line and column.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceLocation {
     pub file: String,
     pub line: u32,
-    pub column: u32,
+    pub col: u32,
 }
 
-/// Metadata for Instructions
-#[derive(Debug, Clone, PartialEq)]
-pub struct Metadata {
-    pub source: Option<SourceLocation>,
-    pub symbol: Option<SymbolId>,
-    pub taint: TaintState,
-    pub tags: HashMap<String, String>,
-}
+// ── Execution context ─────────────────────────────────────────────────────────
 
-
-/// Kind of taint (source of untrusted data)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TaintKind {
-    /// User input (forms, query params, etc.)
-    UserInput,
-    /// Network data (HTTP requests, sockets, etc.)
-    Network,
-    /// File system (file reads, etc.)
-    FileSystem,
-    /// Environment variables
-    Env,
-    /// Cookies
-    Cookie,
-    /// Unknown/unspecified taint source
+/// When in the package lifecycle this code executes.
+///
+/// Populated by the flow linker after IR construction; defaults to `Unknown`
+/// for nodes that haven't been reached from a known entry point yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    /// Runs during `npm install` (preinstall / install / postinstall).
+    Install,
+    /// Normal require-time or export-time execution.
+    Runtime,
+    /// Deferred execution (setTimeout, setInterval, Promise.then).
+    Deferred,
+    /// Cannot be determined statically.
+    #[default]
     Unknown,
 }
 
-impl TaintKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TaintKind::UserInput => "user_input",
-            TaintKind::Network => "network",
-            TaintKind::FileSystem => "filesystem",
-            TaintKind::Env => "env",
-            TaintKind::Cookie => "cookie",
-            TaintKind::Unknown => "unknown",
-        }
-    }
+/// The execution context in which an IR node was observed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ExecutionContext {
+    /// The lifecycle script that triggers this node, if known (e.g. "postinstall").
+    pub entry_point: Option<String>,
+    pub phase: ExecutionPhase,
 }
 
-/// Taint state tracking sources, sinks, and sanitizers
-#[derive(Debug, Clone, PartialEq)]
-pub enum TaintState {
-    /// No taint present
-    Untainted,
-    /// Tainted with specific kinds
-    Tainted {
-        kinds: Vec<TaintKind>,
+// ── Node tags ─────────────────────────────────────────────────────────────────
+
+/// Lightweight annotations on an IR node — not signals, just facts about the node.
+///
+/// Used by confidence scoring and downstream ML/AI layers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeTag {
+    /// The call argument was a static string literal (high confidence).
+    UsesLiteralArg,
+    /// The call argument was dynamic / could not be statically resolved.
+    DynamicArg,
+    /// The string value has Shannon entropy > 4.5 bits/char (likely encoded/obfuscated).
+    HighEntropyString,
+    /// This node was reached through an obfuscated or unresolved code path.
+    ObfuscatedContext,
+}
+
+// ── IR node kinds ─────────────────────────────────────────────────────────────
+
+/// The kind of IR node — what *exists* in the code.
+///
+/// Facts only. No signals, no risk scores, no interpretation.
+/// Signals are derived from these facts in the analysis layer (`vk-core`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IrNodeKind {
+    /// An execution entry point (main field, lifecycle script, bin entry).
+    EntryPoint {
+        /// The install script name if this came from package.json `scripts`,
+        /// e.g. "postinstall", "preinstall", "install". `None` for file-level entries.
+        script: Option<String>,
     },
-    /// Sanitized (taint removed)
-    Sanitized {
-        original_kinds: Vec<TaintKind>,
-        sanitizer: String,
+
+    /// A function declaration or expression boundary.
+    Function {
+        /// The function's identifier, if statically known (`None` for anonymous).
+        name: Option<String>,
     },
-    /// Unknown/ambiguous state
-    Unknown,
+
+    /// A function call expression.
+    Call {
+        /// The callee text as resolved through the binding table.
+        callee: String,
+    },
+
+    /// A child_process method invocation (exec, spawn, execSync, execFile, …).
+    ProcessExec {
+        /// The command string if statically determinable.
+        command: Option<String>,
+    },
+
+    /// A filesystem read operation.
+    FileRead {
+        path: Option<String>,
+    },
+
+    /// A filesystem write operation.
+    FileWrite {
+        path: Option<String>,
+    },
+
+    /// An outbound network request (http/https, fetch, axios, node-fetch, got, …).
+    NetworkRequest {
+        url: Option<String>,
+    },
+
+    /// A direct `eval()` call.
+    Eval {
+        raw_arg: Option<String>,
+    },
+
+    /// A dynamic `import()` expression.
+    DynamicImport {
+        specifier: Option<String>,
+    },
+
+    /// A `new Function(...)` constructor call.
+    FunctionConstructor {
+        body: Option<String>,
+    },
+
+    /// A statically detected encoded string (base64, hex, …).
+    EncodedString {
+        encoding: String,
+        value: String,
+    },
+
+    /// A dynamic or obfuscated code flow (e.g. `require(variable)`).
+    ObfuscatedFlow,
 }
 
-impl TaintState {
-    /// Create a tainted state with a single kind
-    pub fn tainted(kind: TaintKind) -> Self {
-        Self::Tainted {
-            kinds: vec![kind],
-        }
-    }
-    
-    /// Create a tainted state with multiple kinds
-    pub fn tainted_multi(kinds: Vec<TaintKind>) -> Self {
-        Self::Tainted { kinds }
-    }
-    
-    /// Check if this state is tainted
-    pub fn is_tainted(&self) -> bool {
-        matches!(self, TaintState::Tainted { .. })
-    }
-    
-    /// Check if this state is sanitized
-    pub fn is_sanitized(&self) -> bool {
-        matches!(self, TaintState::Sanitized { .. })
-    }
-    
-    /// Get taint kinds if tainted
-    pub fn kinds(&self) -> Vec<TaintKind> {
-        match self {
-            TaintState::Tainted { kinds } => kinds.clone(),
-            TaintState::Sanitized { original_kinds, .. } => original_kinds.clone(),
-            _ => Vec::new(),
-        }
-    }
-    
-    /// Merge two taint states (union of kinds)
-    pub fn merge(&self, other: &Self) -> Self {
-        let mut all_kinds = self.kinds();
-        all_kinds.extend(other.kinds());
-        all_kinds.sort_by_key(|k| k.as_str());
-        all_kinds.dedup();
-        
-        if all_kinds.is_empty() {
-            TaintState::Untainted
-        } else {
-            TaintState::Tainted { kinds: all_kinds }
-        }
-    }
+// ── IR node ───────────────────────────────────────────────────────────────────
+
+/// A single node in the behavioural IR graph.
+///
+/// **ID design:** `"<file>:<line>:<Kind>:<sha256_12>"` — the 12-char hash folds
+/// in column number and any payload value (callee text, command, URL…) so two
+/// same-kind nodes on the same line get distinct, stable IDs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IrNode {
+    pub id: String,
+    pub kind: IrNodeKind,
+    pub location: SourceLocation,
+    /// Lightweight fact-annotations auto-computed at construction time.
+    pub tags: Vec<NodeTag>,
+    /// Execution context populated by the flow linker; defaults to `Unknown`.
+    pub context: ExecutionContext,
 }
 
-impl Default for TaintState {
-    fn default() -> Self {
-        Self::Untainted
-    }
-}
-
-/// Annotated node with metadata
-#[derive(Debug, Clone, PartialEq)]
-pub struct Annotated<T> {
-    pub node: T,
-    pub meta: Metadata,
-}
-
-
-
-/// Import statement
-pub struct Import {
-    pub specifiers: Vec<ImportSpecifier>,
-    pub source: String,
-}
-
-/// Import specifier (default, named, namespace)
-pub enum ImportSpecifier {
-    Default { local: String },
-    Named { local: String, imported: String },
-    Namespace { local: String },
-}
-
-/// Export statement
-pub struct Export {
-    pub specifiers: Vec<ExportSpecifier>,
-    pub source: Option<String>, // None for local exports, Some for re-exports
-}
-
-/// Export specifier
-pub enum ExportSpecifier {
-    Default { local: String },
-    Named { local: String, exported: Option<String> },
-}
-
-/// Symbol identifier (opaque)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SymbolId(pub u32);
-
-/// Scope identifier (opaque)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ScopeId(pub u32);
-
-/// Symbol table for a module
-#[derive(Clone)]
-pub struct SymbolTable {
-    symbols: HashMap<SymbolId, Symbol>,
-    by_name: HashMap<String, Vec<SymbolId>>,
-    next_id: u32,
-}
-
-impl SymbolTable {
-    pub fn new() -> Self {
+impl IrNode {
+    /// Construct an `IrNode` with auto-computed tags and a collision-safe ID.
+    pub fn new(kind: IrNodeKind, location: SourceLocation) -> Self {
+        let id = make_stable_id(&kind, &location);
+        let tags = auto_tags(&kind);
         Self {
-            symbols: HashMap::new(),
-            by_name: HashMap::new(),
-            next_id: 0,
-        }
-    }
-
-    pub fn add_symbol(&mut self, name: String, kind: SymbolKind, scope_id: ScopeId) -> SymbolId {
-        let id = SymbolId(self.next_id);
-        self.next_id += 1;
-        
-        let symbol = Symbol {
-            name,
-            scope_id,
+            id,
             kind,
-        };
-        
-        self.symbols.insert(id, symbol.clone());
-        self.by_name.entry(symbol.name.clone())
-            .or_insert_with(Vec::new)
-            .push(id);
-        
-        id
-    }
-
-    pub fn get_symbol(&self, id: SymbolId) -> Option<&Symbol> {
-        self.symbols.get(&id)
-    }
-
-    pub fn find_symbols(&self, name: &str) -> Vec<&Symbol> {
-        self.by_name.get(name)
-            .map(|ids| ids.iter().filter_map(|id| self.symbols.get(id)).collect())
-            .unwrap_or_default()
-    }
-    
-    /// Find symbol IDs by name
-    pub fn find_symbol_ids(&self, name: &str) -> Vec<SymbolId> {
-        self.by_name.get(name)
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-/// Symbol information
-#[derive(Debug, Clone)]
-pub struct Symbol {
-    pub name: String,
-    pub scope_id: ScopeId,
-    pub kind: SymbolKind,
-}
-
-/// Kind of symbol
-#[derive(Debug, Clone, PartialEq)]
-pub enum SymbolKind {
-    Import,
-    Local,
-    Parameter,
-    Closure,
-    Function,
-    Variable,
-}
-
-/// Module dependency graph
-pub struct ModuleGraph {
-    modules: HashMap<String, ModuleNode>,
-}
-
-/// Node in module graph
-struct ModuleNode {
-    dependencies: Vec<String>,
-    dependents: Vec<String>,
-}
-
-impl ModuleGraph {
-    pub fn new() -> Self {
-        Self {
-            modules: HashMap::new(),
+            location,
+            tags,
+            context: ExecutionContext::default(),
         }
     }
 
-    pub fn add_module(&mut self, path: String) {
-        if !self.modules.contains_key(&path) {
-            self.modules.insert(path, ModuleNode {
-                dependencies: Vec::new(),
-                dependents: Vec::new(),
-            });
-        }
-    }
-
-    pub fn add_dependency(&mut self, from: &str, to: &str) {
-        self.add_module(from.to_string());
-        self.add_module(to.to_string());
-        
-        if let Some(node) = self.modules.get_mut(from) {
-            if !node.dependencies.contains(&to.to_string()) {
-                node.dependencies.push(to.to_string());
+    /// Construct an `IrNode` and append extra tags to the auto-computed set.
+    pub fn with_tags(kind: IrNodeKind, location: SourceLocation, extra_tags: Vec<NodeTag>) -> Self {
+        let mut node = Self::new(kind, location);
+        for tag in extra_tags {
+            if !node.tags.contains(&tag) {
+                node.tags.push(tag);
             }
         }
-        
-        if let Some(node) = self.modules.get_mut(to) {
-            if !node.dependents.contains(&from.to_string()) {
-                node.dependents.push(from.to_string());
-            }
-        }
-    }
-
-    pub fn get_dependencies(&self, path: &str) -> &[String] {
-        self.modules.get(path)
-            .map(|n| n.dependencies.as_slice())
-            .unwrap_or(&[])
-    }
-
-    pub fn get_dependents(&self, path: &str) -> &[String] {
-        self.modules.get(path)
-            .map(|n| n.dependents.as_slice())
-            .unwrap_or(&[])
+        node
     }
 }
 
+// ── ID generation ─────────────────────────────────────────────────────────────
+
+fn make_stable_id(kind: &IrNodeKind, loc: &SourceLocation) -> String {
+    let extra = id_extra(kind);
+    let raw = match &extra {
+        Some(e) => format!("{}:{}:{}:{}:{}", loc.file, loc.line, loc.col, kind_tag(kind), e),
+        None    => format!("{}:{}:{}:{}", loc.file, loc.line, loc.col, kind_tag(kind)),
+    };
+    let digest = Sha256::digest(raw.as_bytes());
+    let hash12 = &hex::encode(digest)[..12];
+    format!("{}:{}:{}:{}", loc.file, loc.line, kind_tag(kind), hash12)
+}
+
+/// Extract the payload value used to disambiguate same-kind nodes on the same line.
+fn id_extra(kind: &IrNodeKind) -> Option<String> {
+    match kind {
+        IrNodeKind::Call { callee }              => Some(callee.clone()),
+        IrNodeKind::ProcessExec { command }      => command.clone(),
+        IrNodeKind::NetworkRequest { url }       => url.clone(),
+        IrNodeKind::FileRead { path }            => path.clone(),
+        IrNodeKind::FileWrite { path }           => path.clone(),
+        IrNodeKind::Function { name }            => name.clone(),
+        IrNodeKind::Eval { raw_arg }             => raw_arg.clone(),
+        IrNodeKind::FunctionConstructor { body } => body.clone(),
+        IrNodeKind::DynamicImport { specifier }  => specifier.clone(),
+        IrNodeKind::EncodedString { value, .. }  => Some(value.clone()),
+        IrNodeKind::EntryPoint { script }        => script.clone(),
+        IrNodeKind::ObfuscatedFlow               => None,
+    }
+}
+
+pub fn kind_tag(kind: &IrNodeKind) -> &'static str {
+    match kind {
+        IrNodeKind::EntryPoint { .. }          => "EntryPoint",
+        IrNodeKind::Function { .. }            => "Function",
+        IrNodeKind::Call { .. }                => "Call",
+        IrNodeKind::ProcessExec { .. }         => "ProcessExec",
+        IrNodeKind::FileRead { .. }            => "FileRead",
+        IrNodeKind::FileWrite { .. }           => "FileWrite",
+        IrNodeKind::NetworkRequest { .. }      => "NetworkRequest",
+        IrNodeKind::Eval { .. }                => "Eval",
+        IrNodeKind::DynamicImport { .. }       => "DynamicImport",
+        IrNodeKind::FunctionConstructor { .. } => "FunctionConstructor",
+        IrNodeKind::EncodedString { .. }       => "EncodedString",
+        IrNodeKind::ObfuscatedFlow             => "ObfuscatedFlow",
+    }
+}
+
+// ── Auto-tagging ──────────────────────────────────────────────────────────────
+
+/// Infer `UsesLiteralArg` / `DynamicArg` / `HighEntropyString` from the node kind.
+fn auto_tags(kind: &IrNodeKind) -> Vec<NodeTag> {
+    let mut tags = Vec::new();
+
+    match kind {
+        IrNodeKind::ProcessExec { command } => {
+            push_arg_tag(&mut tags, command.as_deref());
+        }
+        IrNodeKind::NetworkRequest { url } => {
+            push_arg_tag(&mut tags, url.as_deref());
+        }
+        IrNodeKind::FileRead { path } | IrNodeKind::FileWrite { path } => {
+            push_arg_tag(&mut tags, path.as_deref());
+        }
+        IrNodeKind::Eval { raw_arg } => {
+            push_arg_tag(&mut tags, raw_arg.as_deref());
+        }
+        IrNodeKind::FunctionConstructor { body } => {
+            push_arg_tag(&mut tags, body.as_deref());
+        }
+        IrNodeKind::DynamicImport { specifier } => {
+            push_arg_tag(&mut tags, specifier.as_deref());
+        }
+        IrNodeKind::EncodedString { value, .. } => {
+            tags.push(NodeTag::UsesLiteralArg);
+            if shannon_entropy(value) > 4.5 {
+                tags.push(NodeTag::HighEntropyString);
+            }
+        }
+        IrNodeKind::ObfuscatedFlow => {
+            tags.push(NodeTag::DynamicArg);
+        }
+        _ => {}
+    }
+
+    tags
+}
+
+fn push_arg_tag(tags: &mut Vec<NodeTag>, value: Option<&str>) {
+    match value {
+        Some(v) => {
+            tags.push(NodeTag::UsesLiteralArg);
+            if shannon_entropy(v) > 4.5 {
+                tags.push(NodeTag::HighEntropyString);
+            }
+        }
+        None => tags.push(NodeTag::DynamicArg),
+    }
+}
+
+/// Shannon entropy in bits per character.
+pub fn shannon_entropy(s: &str) -> f64 {
+    if s.is_empty() { return 0.0; }
+    let mut freq = [0u32; 256];
+    for b in s.bytes() { freq[b as usize] += 1; }
+    let n = s.len() as f64;
+    freq.iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| { let p = c as f64 / n; -p * p.log2() })
+        .sum()
+}
+
+// ── File IR ───────────────────────────────────────────────────────────────────
+
+/// The complete IR output for a single JS/TS file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileIr {
+    pub file: String,
+    pub nodes: Vec<IrNode>,
+}

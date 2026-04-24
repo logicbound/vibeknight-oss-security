@@ -1,8 +1,12 @@
 [workspace]
 resolver = "1"
-members = [ "macros", 
+members = [
+    "macros",
     "vk-cli",
     "vk-core",
     "vk-ir",
-    "vk-lang-js"
+    "vk-lang-js",
+    "vk-npm",
+    "vk-ingestor",
+    "vk-downloader",
 ]
