@@ -41,4 +41,4 @@ COPY --from=builder /build/target/release/vk-downloader /usr/local/bin/vk-downlo
 # Artifacts live on a shared volume mounted at /artifacts
 VOLUME ["/artifacts"]
 
-ENTRYPOINT ["vk-downloader", "--artifacts", "/artifacts"]
+ENTRYPOINT ["vk-downloader", "--artifacts", "/artifacts", "--redis-url", "redis://redis:6379/"]
