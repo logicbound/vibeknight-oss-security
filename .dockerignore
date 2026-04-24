@@ -1,0 +1,15 @@
+target/
+**/target/
+.git/
+.gitignore
+**/*.swp
+**/*.log
+**/*.tmp
+.env
+.DS_Store
+.vscode/
+.idea/
+node_modules/
+*.md
+Dockerfile
+docker-compose.yml
