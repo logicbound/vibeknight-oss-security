@@ -1,0 +1,14 @@
+{
+    "name": "fake-native-lib",
+    "version": "1.0.0",
+    "main": "./index.js",
+    "scripts": {
+        "install": "node-gyp rebuild",
+        "postinstall": "node-gyp rebuild"
+    },
+    "dependencies": {
+        "node-addon-api": "^6.0.0",
+        "bindings": "^1.5.0"
+    },
+    "keywords": ["native", "addon", "n-api"]
+}

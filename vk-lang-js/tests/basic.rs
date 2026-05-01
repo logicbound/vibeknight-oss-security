@@ -9,7 +9,7 @@ fn detects_process_exec_via_require_binding() {
     "#;
     let ir = analyse_file(src, "install.js");
     assert!(ir.nodes.iter().any(|n| matches!(&n.kind,
-        IrNodeKind::ProcessExec { command: Some(cmd) } if cmd.contains("curl")
+        IrNodeKind::ProcessExec { command: Some(cmd), .. } if cmd.contains("curl")
     )), "expected ProcessExec node with curl command");
 }
 
@@ -21,7 +21,7 @@ fn detects_process_exec_via_destructure() {
     "#;
     let ir = analyse_file(src, "install.js");
     assert!(ir.nodes.iter().any(|n| matches!(&n.kind,
-        IrNodeKind::ProcessExec { command: Some(cmd) } if cmd.contains("rm")
+        IrNodeKind::ProcessExec { command: Some(cmd), .. } if cmd.contains("rm")
     )));
 }
 
@@ -33,7 +33,7 @@ fn detects_network_request() {
     "#;
     let ir = analyse_file(src, "index.js");
     assert!(ir.nodes.iter().any(|n| matches!(&n.kind,
-        IrNodeKind::NetworkRequest { url: Some(u) } if u.contains("attacker")
+        IrNodeKind::NetworkRequest { url: Some(u), .. } if u.contains("attacker")
     )));
 }
 
@@ -91,7 +91,7 @@ fn detects_bracket_access_require() {
     "#;
     let ir = analyse_file(src, "install.js");
     assert!(ir.nodes.iter().any(|n| matches!(&n.kind,
-        IrNodeKind::ProcessExec { command: Some(cmd) } if cmd == "whoami"
+        IrNodeKind::ProcessExec { command: Some(cmd), .. } if cmd == "whoami"
     )));
 }
 

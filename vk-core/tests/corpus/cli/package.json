@@ -1,0 +1,9 @@
+{
+    "name": "fake-cli",
+    "version": "1.0.0",
+    "bin": { "fake-cli": "./cli.js" },
+    "dependencies": {
+        "commander": "^10.0.0"
+    },
+    "keywords": ["cli", "command-line"]
+}

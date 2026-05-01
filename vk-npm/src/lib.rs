@@ -34,6 +34,11 @@ pub struct PackageGraph {
     /// All JS/TS source files in the package.
     pub files: Vec<String>,
     pub entry_points: Vec<EntryPoint>,
+    /// The parsed `package.json` manifest, passed through so downstream
+    /// analysis (package-type classification) can read `scripts`,
+    /// `dependencies`, `keywords`, `bin`, etc. without re-parsing.
+    #[serde(default)]
+    pub manifest: serde_json::Value,
     /// Absolute path of the extracted package on disk (not serialised).
     #[serde(skip)]
     pub extracted_dir: PathBuf,
@@ -73,6 +78,7 @@ pub fn from_extracted_dir(
         integrity_hash: integrity_hash.to_string(),
         files,
         entry_points,
+        manifest,
         extracted_dir: dir.to_path_buf(),
     })
 }
@@ -170,6 +176,7 @@ fn ingest_bytes(tgz_bytes: &[u8]) -> Result<(PackageGraph, tempfile::TempDir), N
         integrity_hash,
         files,
         entry_points,
+        manifest,
         extracted_dir: pkg_dir,
     };
 

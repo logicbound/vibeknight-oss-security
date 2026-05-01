@@ -62,6 +62,7 @@ fn make_fixture_graph(fixture: &str, install_scripts: &[(&str, &str)]) -> Packag
         integrity_hash: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         files,
         entry_points,
+        manifest: serde_json::Value::Null,
         extracted_dir: dir,
     }
 }

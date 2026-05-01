@@ -1,6 +1,10 @@
+pub mod attacker_control;
+pub mod benign_patterns;
 pub mod callgraph;
 pub mod finding;
 pub mod flow;
+pub mod package_type;
+pub mod scoring;
 pub mod signals;
 
 use std::collections::HashSet;
@@ -9,7 +13,7 @@ use vk_ir::{ExecutionContext, ExecutionPhase, IrNode, IrNodeKind, SourceLocation
 use vk_lang_js::analyse_file;
 use vk_npm::PackageGraph;
 
-pub use finding::{Evidence, Finding};
+pub use finding::{build_finding, Evidence, Finding};
 pub use flow::BehaviorGraph;
 pub use signals::Signal;
 
@@ -33,8 +37,12 @@ pub struct IrGraph {
 /// 4. Build behaviour graph (execution chains)
 /// 5. Post-pass: propagate ExecutionContext.phase for install-script entry points
 /// 6. Derive signals
-/// 7. Normalise output ordering
-/// 8. Assemble Finding
+/// 7. Classify package (DevTool / CLI / RuntimeLib)
+/// 8. Compute attacker-control feature
+/// 9. Collect benign-pattern matches
+/// 10. Build feature vector
+/// 11. Compose composite risk score
+/// 12. Assemble Finding
 pub fn analyse(package: &PackageGraph) -> (IrGraph, BehaviorGraph, Finding) {
     // ── Stage 1+2: AST → IR ───────────────────────────────────────────────────
     let mut all_nodes: Vec<IrNode> = Vec::new();
@@ -81,10 +89,7 @@ pub fn analyse(package: &PackageGraph) -> (IrGraph, BehaviorGraph, Finding) {
     let behavior_graph = flow::build_behavior_graph(&all_nodes, &call_graph);
 
     // ── Stage 5: ExecutionContext propagation ─────────────────────────────────
-    // Find node IDs that appear in chains rooted at install-script entry points
     let install_node_ids = collect_install_node_ids(&behavior_graph);
-
-    // Annotate those nodes with phase=Install
     for node in &mut all_nodes {
         if let Some((phase, entry_point)) = install_node_ids.get(&node.id) {
             node.context = ExecutionContext {
@@ -103,9 +108,36 @@ pub fn analyse(package: &PackageGraph) -> (IrGraph, BehaviorGraph, Finding) {
     };
 
     // ── Stage 7: Signal derivation ────────────────────────────────────────────
-    let signals = signals::derive_signals(&all_nodes, &behavior_graph);
+    let signals_vec = signals::derive_signals(&all_nodes, &behavior_graph);
 
-    // ── Stage 8: Evidence extraction ──────────────────────────────────────────
+    // ── Stage 8: Package classification ───────────────────────────────────────
+    let manifest_for_class = if package.manifest.is_null() {
+        None
+    } else {
+        Some(&package.manifest)
+    };
+    let classification = package_type::classify_package(manifest_for_class, &all_nodes);
+
+    // ── Stage 9: Attacker-control feature ─────────────────────────────────────
+    let attacker_control = attacker_control::compute_attacker_control(&all_nodes, &behavior_graph);
+
+    // ── Stage 10: Benign-pattern matches ──────────────────────────────────────
+    let benign_matches = benign_patterns::collect_benign_matches(&all_nodes);
+
+    // ── Stage 11: Feature vector ──────────────────────────────────────────────
+    let features = scoring::build_feature_vector(&all_nodes, &behavior_graph.execution_chains);
+
+    // ── Stage 12: Composite score ─────────────────────────────────────────────
+    let score = scoring::compute_risk_score(&scoring::ScoreInputs {
+        signals: &signals_vec,
+        chains: &behavior_graph.execution_chains,
+        nodes: &all_nodes,
+        attacker_control: attacker_control.score,
+        package_class: &classification.class,
+        benign_matches: &benign_matches,
+    });
+
+    // ── Stage 13: Evidence extraction ─────────────────────────────────────────
     let evidence: Vec<Evidence> = all_nodes
         .iter()
         .filter(|n| is_evidence_node(n))
@@ -117,13 +149,18 @@ pub fn analyse(package: &PackageGraph) -> (IrGraph, BehaviorGraph, Finding) {
         })
         .collect();
 
-    let finding = Finding::new(
+    let finding = build_finding(
         package.package.clone(),
         package.version.clone(),
         package.integrity_hash.clone(),
-        signals,
+        signals_vec,
         behavior_graph.execution_chains.clone(),
         evidence,
+        classification,
+        attacker_control,
+        benign_matches,
+        features,
+        score,
     );
 
     (ir_graph, behavior_graph, finding)
@@ -139,9 +176,7 @@ fn collect_install_node_ids(
     let mut result = std::collections::HashMap::new();
 
     for chain in &behavior_graph.execution_chains {
-        // Only propagate for install-script entry points
         let Some(script_name) = &chain.entry_point.script else { continue };
-
         for step in &chain.chain {
             result.entry(step.node_id.clone()).or_insert_with(|| {
                 (ExecutionPhase::Install, script_name.clone())
@@ -197,11 +232,11 @@ fn kind_tag_str(kind: &IrNodeKind) -> &'static str {
 
 fn extract_detail(kind: &IrNodeKind) -> Option<String> {
     match kind {
-        IrNodeKind::ProcessExec { command }       => command.clone(),
-        IrNodeKind::NetworkRequest { url }        => url.clone(),
-        IrNodeKind::Eval { raw_arg }              => raw_arg.clone(),
-        IrNodeKind::FunctionConstructor { body }  => body.clone(),
-        IrNodeKind::EncodedString { value, .. }   => Some(value.clone()),
+        IrNodeKind::ProcessExec { command, .. }       => command.clone(),
+        IrNodeKind::NetworkRequest { url, .. }        => url.clone(),
+        IrNodeKind::Eval { raw_arg, .. }              => raw_arg.clone(),
+        IrNodeKind::FunctionConstructor { body, .. } => body.clone(),
+        IrNodeKind::EncodedString { value, .. }       => Some(value.clone()),
         _ => None,
     }
 }

@@ -61,6 +61,117 @@ pub enum NodeTag {
     ObfuscatedContext,
 }
 
+// ── Data source / argument provenance ────────────────────────────────────────
+
+/// Where the argument to a sink came from — the *provenance* of a value.
+///
+/// This is the core feature the scorer uses to distinguish
+/// `execSync("npm rebuild")` (Literal) from `execSync(decodedPayload)`
+/// (Decoded-of-NetworkResponse).
+///
+/// Populated by the language walker during IR construction via a local
+/// 1-hop assignment map. Nothing in this enum is interpreted — it is
+/// purely a fact describing where a value originated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DataSource {
+    /// A static string literal: `"npm rebuild"`.
+    Literal { value: String },
+    /// A template literal with no interpolations — materially a literal.
+    TemplateOnly { segments: Vec<String> },
+    /// A read of `process.env.X` (or `process.env[...]`).
+    EnvVar { name: Option<String> },
+    /// A read of `process.argv`.
+    ProcessArgv,
+    /// The result of a filesystem read.
+    FileReadResult { path: Option<String> },
+    /// The result of a network request (fetch / axios / http.get / ...).
+    NetworkResponse { origin_node_id: Option<String> },
+    /// The result of a decoder call (`atob`, `Buffer.from(x, 'base64')`, ...).
+    Decoded { origin_node_id: Option<String>, encoding: String },
+    /// A concatenation or template-with-interpolations mixing multiple sources.
+    Concatenation { sources: Vec<DataSource> },
+    /// A parameter of the enclosing function (provenance is caller-dependent).
+    FunctionArg { param_name: Option<String> },
+    /// Unknown — the walker couldn't classify the source statically.
+    Unknown,
+}
+
+impl Default for DataSource {
+    fn default() -> Self {
+        DataSource::Unknown
+    }
+}
+
+impl DataSource {
+    /// The variant name as a stable snake-case string — used for features and evidence.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            DataSource::Literal { .. }         => "literal",
+            DataSource::TemplateOnly { .. }    => "template_only",
+            DataSource::EnvVar { .. }          => "env_var",
+            DataSource::ProcessArgv            => "process_argv",
+            DataSource::FileReadResult { .. }  => "file_read_result",
+            DataSource::NetworkResponse { .. } => "network_response",
+            DataSource::Decoded { .. }         => "decoded",
+            DataSource::Concatenation { .. }   => "concatenation",
+            DataSource::FunctionArg { .. }     => "function_arg",
+            DataSource::Unknown                => "unknown",
+        }
+    }
+
+    /// True if this source (or any transitive sub-source) is attacker-controllable.
+    pub fn is_attacker_controllable(&self) -> bool {
+        match self {
+            DataSource::Literal { .. } | DataSource::TemplateOnly { .. } => false,
+            DataSource::EnvVar { .. }
+            | DataSource::ProcessArgv
+            | DataSource::FileReadResult { .. }
+            | DataSource::NetworkResponse { .. }
+            | DataSource::Decoded { .. }
+            | DataSource::FunctionArg { .. }
+            | DataSource::Unknown => true,
+            DataSource::Concatenation { sources } => {
+                sources.iter().any(|s| s.is_attacker_controllable())
+            }
+        }
+    }
+
+    /// True if this source is (transitively) derived from network input.
+    pub fn derives_from_network(&self) -> bool {
+        match self {
+            DataSource::NetworkResponse { .. } => true,
+            DataSource::Decoded { .. } => true, // conservative: decoded could be network-rooted
+            DataSource::Concatenation { sources } => {
+                sources.iter().any(|s| s.derives_from_network())
+            }
+            _ => false,
+        }
+    }
+
+    /// True if this source is (transitively) a decode of some origin.
+    pub fn derives_from_decoded(&self) -> bool {
+        match self {
+            DataSource::Decoded { .. } => true,
+            DataSource::Concatenation { sources } => {
+                sources.iter().any(|s| s.derives_from_decoded())
+            }
+            _ => false,
+        }
+    }
+
+    /// True if this source is (transitively) a purely literal value.
+    pub fn is_fully_literal(&self) -> bool {
+        match self {
+            DataSource::Literal { .. } | DataSource::TemplateOnly { .. } => true,
+            DataSource::Concatenation { sources } => {
+                sources.iter().all(|s| s.is_fully_literal())
+            }
+            _ => false,
+        }
+    }
+}
+
 // ── IR node kinds ─────────────────────────────────────────────────────────────
 
 /// The kind of IR node — what *exists* in the code.
@@ -93,36 +204,51 @@ pub enum IrNodeKind {
     ProcessExec {
         /// The command string if statically determinable.
         command: Option<String>,
+        /// Provenance of the command argument (literal / env / network / decoded / ...).
+        #[serde(default)]
+        arg_source: DataSource,
     },
 
     /// A filesystem read operation.
     FileRead {
         path: Option<String>,
+        #[serde(default)]
+        arg_source: DataSource,
     },
 
     /// A filesystem write operation.
     FileWrite {
         path: Option<String>,
+        #[serde(default)]
+        arg_source: DataSource,
     },
 
     /// An outbound network request (http/https, fetch, axios, node-fetch, got, …).
     NetworkRequest {
         url: Option<String>,
+        #[serde(default)]
+        arg_source: DataSource,
     },
 
     /// A direct `eval()` call.
     Eval {
         raw_arg: Option<String>,
+        #[serde(default)]
+        arg_source: DataSource,
     },
 
     /// A dynamic `import()` expression.
     DynamicImport {
         specifier: Option<String>,
+        #[serde(default)]
+        arg_source: DataSource,
     },
 
     /// A `new Function(...)` constructor call.
     FunctionConstructor {
         body: Option<String>,
+        #[serde(default)]
+        arg_source: DataSource,
     },
 
     /// A statically detected encoded string (base64, hex, …).
@@ -133,6 +259,22 @@ pub enum IrNodeKind {
 
     /// A dynamic or obfuscated code flow (e.g. `require(variable)`).
     ObfuscatedFlow,
+}
+
+impl IrNodeKind {
+    /// If this is a sink node, return its argument provenance.
+    pub fn arg_source(&self) -> Option<&DataSource> {
+        match self {
+            IrNodeKind::ProcessExec { arg_source, .. }
+            | IrNodeKind::FileRead { arg_source, .. }
+            | IrNodeKind::FileWrite { arg_source, .. }
+            | IrNodeKind::NetworkRequest { arg_source, .. }
+            | IrNodeKind::Eval { arg_source, .. }
+            | IrNodeKind::DynamicImport { arg_source, .. }
+            | IrNodeKind::FunctionConstructor { arg_source, .. } => Some(arg_source),
+            _ => None,
+        }
+    }
 }
 
 // ── IR node ───────────────────────────────────────────────────────────────────
@@ -151,6 +293,10 @@ pub struct IrNode {
     pub tags: Vec<NodeTag>,
     /// Execution context populated by the flow linker; defaults to `Unknown`.
     pub context: ExecutionContext,
+    /// The id of the enclosing `Function` node, if the walker knew it.
+    /// `None` for module-scope nodes or nodes emitted before a function opens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_fn_id: Option<String>,
 }
 
 impl IrNode {
@@ -164,6 +310,7 @@ impl IrNode {
             location,
             tags,
             context: ExecutionContext::default(),
+            parent_fn_id: None,
         }
     }
 
@@ -176,6 +323,12 @@ impl IrNode {
             }
         }
         node
+    }
+
+    /// Attach an enclosing function id to this node.
+    pub fn with_parent_fn(mut self, parent_fn_id: Option<String>) -> Self {
+        self.parent_fn_id = parent_fn_id;
+        self
     }
 }
 
@@ -195,18 +348,18 @@ fn make_stable_id(kind: &IrNodeKind, loc: &SourceLocation) -> String {
 /// Extract the payload value used to disambiguate same-kind nodes on the same line.
 fn id_extra(kind: &IrNodeKind) -> Option<String> {
     match kind {
-        IrNodeKind::Call { callee }              => Some(callee.clone()),
-        IrNodeKind::ProcessExec { command }      => command.clone(),
-        IrNodeKind::NetworkRequest { url }       => url.clone(),
-        IrNodeKind::FileRead { path }            => path.clone(),
-        IrNodeKind::FileWrite { path }           => path.clone(),
-        IrNodeKind::Function { name }            => name.clone(),
-        IrNodeKind::Eval { raw_arg }             => raw_arg.clone(),
-        IrNodeKind::FunctionConstructor { body } => body.clone(),
-        IrNodeKind::DynamicImport { specifier }  => specifier.clone(),
-        IrNodeKind::EncodedString { value, .. }  => Some(value.clone()),
-        IrNodeKind::EntryPoint { script }        => script.clone(),
-        IrNodeKind::ObfuscatedFlow               => None,
+        IrNodeKind::Call { callee }                   => Some(callee.clone()),
+        IrNodeKind::ProcessExec { command, .. }       => command.clone(),
+        IrNodeKind::NetworkRequest { url, .. }        => url.clone(),
+        IrNodeKind::FileRead { path, .. }             => path.clone(),
+        IrNodeKind::FileWrite { path, .. }            => path.clone(),
+        IrNodeKind::Function { name }                 => name.clone(),
+        IrNodeKind::Eval { raw_arg, .. }              => raw_arg.clone(),
+        IrNodeKind::FunctionConstructor { body, .. }  => body.clone(),
+        IrNodeKind::DynamicImport { specifier, .. }   => specifier.clone(),
+        IrNodeKind::EncodedString { value, .. }       => Some(value.clone()),
+        IrNodeKind::EntryPoint { script }             => script.clone(),
+        IrNodeKind::ObfuscatedFlow                    => None,
     }
 }
 
@@ -234,22 +387,22 @@ fn auto_tags(kind: &IrNodeKind) -> Vec<NodeTag> {
     let mut tags = Vec::new();
 
     match kind {
-        IrNodeKind::ProcessExec { command } => {
+        IrNodeKind::ProcessExec { command, .. } => {
             push_arg_tag(&mut tags, command.as_deref());
         }
-        IrNodeKind::NetworkRequest { url } => {
+        IrNodeKind::NetworkRequest { url, .. } => {
             push_arg_tag(&mut tags, url.as_deref());
         }
-        IrNodeKind::FileRead { path } | IrNodeKind::FileWrite { path } => {
+        IrNodeKind::FileRead { path, .. } | IrNodeKind::FileWrite { path, .. } => {
             push_arg_tag(&mut tags, path.as_deref());
         }
-        IrNodeKind::Eval { raw_arg } => {
+        IrNodeKind::Eval { raw_arg, .. } => {
             push_arg_tag(&mut tags, raw_arg.as_deref());
         }
-        IrNodeKind::FunctionConstructor { body } => {
+        IrNodeKind::FunctionConstructor { body, .. } => {
             push_arg_tag(&mut tags, body.as_deref());
         }
-        IrNodeKind::DynamicImport { specifier } => {
+        IrNodeKind::DynamicImport { specifier, .. } => {
             push_arg_tag(&mut tags, specifier.as_deref());
         }
         IrNodeKind::EncodedString { value, .. } => {
